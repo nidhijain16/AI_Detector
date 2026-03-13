@@ -226,6 +226,8 @@ async def humanize_stream(req: HumanizeRequest):
             # This is a blocking call. For real production with 100 concurrent users, 
             # you would offload to threadpool or Celery.
             out = paraphrase_model(prompt, max_length=512, num_return_sequences=1, truncation=True)
+            rewritten_text = out[0]['generated_text']
+            
             # Generate a word-level diff for highlighting
             s1 = chunk.split()
             s2 = rewritten_text.split()
