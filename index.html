@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ForensicText - AI Detection Tool</title>
+    <!-- Load React, ReactDOM and Babel from CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background: #06090f;
+            color: #dce8f0;
+            font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif;
+            overflow-x: hidden;
+        }
+
+        textarea,
+        input,
+        select {
+            font-family: inherit;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        @keyframes fadeUp {
+            from {
+                opacity: 0;
+                transform: translateY(12px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .panel {
+            animation: fadeUp 0.35s ease forwards;
+        }
+
+        ::-webkit-scrollbar {
+            width: 4px;
+            height: 4px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #06090f;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #1a2540;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useRef, useMemo, useEffect } = React;
+
+        // ═══════════════════════════════════════════════════════
+        //  API ROUTES (Local FastAPI Server)
+        // ═══════════════════════════════════════════════════════
+        const API_BASE = "/api"; // Same origin as the server
+
+        // ═══════════════════════════════════════════════════════
+        //  CLIENT-SIDE SIGNAL COMPUTATION
+        // ═══════════════════════════════════════════════════════
+        const AI_TRANSITIONS = [
+            "furthermore", "moreover", "additionally", "in conclusion", "in summary",
+            "it is important to note", "it is worth noting", "notably", "significantly",
+            "consequently", "it should be noted", "in addition", "ultimately", "therefore",
+            "thus", "needless to say", "to summarize", "to conclude", "as a result",
+            "in the realm of", "in today's world", "delve into", "underscore", "crucial",
+            "on the other hand", "it goes without saying", "as we can see"
+        ];
+
+        function splitSentences(text) {
+            return (text.match(/[^.!?\n]+[.!?\n]+/g) || [])
+                .map(s => s.trim())
+                .filter(s => s.split(/\s+/).length >= 3);
+        }
+
+        function computeBurstiness(text) {
+            const sentences = splitSentences(text);
+            if (sentences.length < 2) return { cv: 0.3, score: 50, label: "Need more text", sentences, lengths: [] };
+            const lengths = sentences.map(s => s.split(/\s+/).length);
+            const mean = lengths.reduce((a, b) => a + b, 0) / lengths.length;
+            const variance = lengths.reduce((a, b) => a + (b - mean) ** 2, 0) / lengths.length;
+            const stdDev = Math.sqrt(variance);
+            const cv = mean > 0 ? stdDev / mean : 0;
+            const humanScore = Math.round(Math.min(cv / 0.6, 1) * 100);
+            const label = cv < 0.2 ? "Very Uniform (AI-like)" : cv < 0.35 ? "Moderately Varied" : cv < 0.5 ? "Varied" : "Highly Varied (Human-like)";
+            return { cv: +cv.toFixed(3), score: humanScore, mean: +mean.toFixed(1), stdDev: +stdDev.toFixed(1), label, sentences, lengths };
+        }
+
+        function computeTTR(text) {
+            const words = (text.toLowerCase().match(/\b[a-z]{2,}\b/g) || []);
+            if (!words.length) return { ttr: 0.5, aiScore: 50 };
+            const unique = new Set(words);
+            const ttr = unique.size / words.length;
+            const aiScore = Math.round(Math.max(0, Math.min(1, (0.65 - ttr) / 0.4)) * 100);
+            return { ttr: +ttr.toFixed(3), unique: unique.size, total: words.length, aiScore };
+        }
+
+        function computeTransitions(text) {
+            const lower = text.toLowerCase();
+            const found = AI_TRANSITIONS.filter(t => lower.includes(t));
+            const wordCount = (text.match(/\b\w+\b/g) || []).length;
+            const density = wordCount > 0 ? (found.length / wordCount) * 100 : 0;
+            const aiScore = Math.min(Math.round(density * 35), 100);
+            return { found, count: found.length, density: +density.toFixed(2), aiScore };
+        }
+
+        function computeRepetition(text) {
+            const words = (text.toLowerCase().match(/\b[a-z]+\b/g) || []);
+            if (words.length < 6) return { ratio: 0, aiScore: 0 };
+            const trigrams = {};
+            for (let i = 0; i < words.length - 2; i++) {
+                const k = `${words[i]} ${words[i + 1]} ${words[i + 2]}`;
+                trigrams[k] = (trigrams[k] || 0) + 1;
+            }
+            const total = Object.keys(trigrams).length;
+            const repeated = Object.values(trigrams).filter(v => v > 1).length;
+            const ratio = total > 0 ? repeated / total : 0;
+            return { ratio: +ratio.toFixed(3), aiScore: Math.min(Math.round(ratio * 250), 100) };
+        }
+
+        function computeSentenceUniformity(text) {
+            const sentences = splitSentences(text);
+            if (sentences.length < 3) return { score: 0, aiScore: 50 };
+            const lengths = sentences.map(s => s.split(/\s+/).length);
+            const max = Math.max(...lengths), min = Math.min(...lengths);
+            const range = max - min;
+            const uniformityAI = Math.round(Math.max(0, Math.min(1, (30 - range) / 25)) * 100);
+            return { range, max, min, aiScore: uniformityAI };
+        }
+
+        function computeLocalSignals(text) {
+            const burstiness = computeBurstiness(text);
+            const ttr = computeTTR(text);
+            const transitions = computeTransitions(text);
+            const repetition = computeRepetition(text);
+            const uniformity = computeSentenceUniformity(text);
+            const localAI = Math.round(
+                (1 - burstiness.score / 100) * 100 * 0.30 +
+                ttr.aiScore * 0.25 +
+                transitions.aiScore * 0.20 +
+                repetition.aiScore * 0.15 +
+                uniformity.aiScore * 0.10
+            );
+            return { burstiness, ttr, transitions, repetition, uniformity, localAI };
+        }
+
+        function jaccardSim(a, b) {
+            const sA = new Set(a.toLowerCase().match(/\b\w+\b/g) || []);
+            const sB = new Set(b.toLowerCase().match(/\b\w+\b/g) || []);
+            if (!sA.size || !sB.size) return 0;
+            const inter = [...sA].filter(x => sB.has(x)).length;
+            return inter / (sA.size + sB.size - inter);
+        }
+
+        const STOCK_PHRASES = [
+            "in today's fast-paced world", "in this day and age", "since the dawn of time",
+            "it goes without saying", "needless to say", "last but not least",
+            "at the end of the day", "think outside the box", "paradigm shift",
+            "going forward", "circle back", "synergy", "leverage", "deep dive",
+            "take it to the next level", "move the needle", "in the realm of",
+            "shed light on", "unpack the complexities"
+        ];
+
+        function computePlagiarismSignals(text) {
+            const sentences = splitSentences(text);
+            const lower = text.toLowerCase();
+            const pairs = [];
+            for (let i = 0; i < sentences.length; i++) {
+                for (let j = i + 1; j < sentences.length; j++) {
+                    const sim = jaccardSim(sentences[i], sentences[j]);
+                    if (sim > 0.40) pairs.push({ i, j, sim, sA: sentences[i], sB: sentences[j] });
+                }
+            }
+            const foundStock = STOCK_PHRASES.filter(p => lower.includes(p));
+            const highSim = pairs.filter(p => p.sim > 0.65);
+            const penalty = (highSim.length / Math.max(sentences.length, 1)) * 45 + foundStock.length * 4;
+            const originality = Math.max(0, Math.min(100, Math.round(100 - penalty)));
+            const verdict = originality >= 85 ? "Highly Original" : originality >= 65 ? "Mostly Original" : originality >= 45 ? "Partially Repetitive" : originality >= 25 ? "Low Originality" : "Highly Repetitive";
+            return { sentences, pairs: pairs.sort((a, b) => b.sim - a.sim).slice(0, 8), foundStock, originality, verdict };
+        }
+
+        const C = {
+            bg: "#06090f",
+            surface: "#0c1220",
+            border: "#1a2540",
+            borderLight: "#243050",
+            text: "#dce8f0",
+            muted: "#4a6080",
+            dim: "#253245",
+            amber: "#f59e0b",
+            teal: "#2dd4bf",
+            red: "#f87171",
+            green: "#4ade80",
+            blue: "#60a5fa",
+        };
+
+        // ═══════════════════════════════════════════════════════
+        //  UI COMPONENTS
+        // ═══════════════════════════════════════════════════════
+        function DiffViewer({ chunks }) {
+            if (!chunks || chunks.length === 0) return null;
+
+            return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {chunks.map((chunk, idx) => (
+                        <div key={idx} style={{ background: C.bg, padding: 15, borderRadius: 8, fontSize: 13, lineHeight: 1.6, borderLeft: `3px solid ${C.teal}` }}>
+                            {chunk.diff.map(([op, i1, i2, j1, j2], i) => {
+                                const original = chunk.original_words.slice(i1, i2).join(" ");
+                                const rewritten = chunk.rewritten_words.slice(j1, j2).join(" ");
+
+                                if (op === 'equal') return <span key={i}>{rewritten} </span>;
+                                if (op === 'replace') return (
+                                    <span key={i}>
+                                        <span style={{ color: C.red, textDecoration: "line-through", opacity: 0.6 }}>{original}</span>{" "}
+                                        <span style={{ color: C.green, fontWeight: "bold" }}>{rewritten}</span>{" "}
+                                    </span>
+                                );
+                                if (op === 'insert') return <span key={i} style={{ color: C.green, fontWeight: "bold" }}>{rewritten} </span>;
+                                if (op === 'delete') return <span key={i} style={{ color: C.red, textDecoration: "line-through", opacity: 0.6 }}>{original} </span>;
+                                return null;
+                            })}
+                        </div>
+                    ))}
+                </div>
+            );
+        }
+
+        function GaugeBar({ label, value, aiScore, helpText }) {
+            const fillColor = aiScore > 65 ? C.red : aiScore > 35 ? C.amber : C.teal;
+            return (
+                <div style={{ marginBottom: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5, alignItems: "baseline" }}>
+                        <span style={{ fontSize: 11, fontFamily: "monospace", color: C.muted, letterSpacing: "0.08em" }}>{label}</span>
+                        <span style={{ fontSize: 11, fontFamily: "monospace", color: fillColor }}>
+                            {aiScore > 65 ? "AI-like" : aiScore > 35 ? "Mixed" : "Human-like"} · {value}
+                        </span>
+                    </div>
+                    <div style={{ height: 6, background: C.dim, borderRadius: 3, overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: `${aiScore}%`, background: fillColor, borderRadius: 3, transition: "width 0.8s ease" }} />
+                    </div>
+                    {helpText && <div style={{ fontSize: 10, color: C.dim, marginTop: 3, fontFamily: "monospace" }}>{helpText}</div>}
+                </div>
+            );
+        }
+
+        function ScoreRing({ score, label, mode = "ai", size = 100 }) {
+            const r = (size / 2) - 10;
+            const circ = 2 * Math.PI * r;
+            const offset = circ - (score / 100) * circ;
+            const color = mode === "ai" ? (score > 65 ? C.red : score > 35 ? C.amber : C.teal) : (score > 65 ? C.teal : score > 35 ? C.amber : C.red);
+            const cx = size / 2, cy = size / 2;
+            return (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+                    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+                        <circle cx={cx} cy={cy} r={r} fill="none" stroke={C.dim} strokeWidth="8" />
+                        <circle cx={cx} cy={cy} r={r} fill="none" stroke={color} strokeWidth="8"
+                            strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round"
+                            transform={`rotate(-90 ${cx} ${cy})`}
+                            style={{ transition: "stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1)" }} />
+                        <text x={cx} y={cy - 4} textAnchor="middle" fill={C.text} fontSize={size * 0.19} fontWeight="700" fontFamily="monospace">{score}%</text>
+                        <text x={cx} y={cy + size * 0.12} textAnchor="middle" fill={C.muted} fontSize={size * 0.09} fontFamily="monospace">{label}</text>
+                    </svg>
+                </div>
+            );
+        }
+
+        function BurstinessChart({ lengths, mean }) {
+            if (!lengths?.length) return null;
+            const maxLen = Math.max(...lengths, 1);
+            return (
+                <div style={{ marginTop: 10 }}>
+                    <div style={{ fontSize: 10, color: C.muted, fontFamily: "monospace", marginBottom: 6, letterSpacing: "0.08em" }}>
+                        SENTENCE LENGTHS — mean: {mean}w
+                    </div>
+                    <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 40 }}>
+                        {lengths.map((l, i) => {
+                            const h = Math.max(4, (l / maxLen) * 36);
+                            const deviation = Math.abs(l - parseFloat(mean));
+                            const varied = deviation > parseFloat(mean) * 0.3;
+                            return <div key={i} title={`Sentence ${i + 1}: ${l} words`} style={{ flex: 1, height: h, background: varied ? C.teal : C.amber, borderRadius: "2px 2px 0 0", opacity: 0.85, transition: "height 0.5s ease" }} />;
+                        })}
+                    </div>
+                </div>
+            );
+        }
+
+        function SentenceHighlight({ sentences, burstiness }) {
+            if (!sentences?.length) return null;
+            const { lengths, mean } = burstiness;
+            return (
+                <div style={{ marginTop: 12 }}>
+                    <div style={{ fontSize: 13, lineHeight: 1.9, color: C.text }}>
+                        {sentences.map((s, i) => {
+                            const len = lengths[i] || s.split(/\s+/).length;
+                            const deviation = Math.abs(len - parseFloat(mean));
+                            const isVaried = deviation > parseFloat(mean) * 0.3;
+                            const hasTransition = AI_TRANSITIONS.some(t => s.toLowerCase().includes(t));
+                            const borderColor = hasTransition ? C.red : isVaried ? C.teal : C.amber;
+                            return <span key={i} style={{ borderBottom: `2px solid ${borderColor}`, paddingBottom: 1, marginRight: 4, backgroundColor: hasTransition ? "rgba(248,113,113,0.08)" : "transparent", borderRadius: 2 }}>{s}</span>;
+                        })}
+                    </div>
+                </div>
+            );
+        }
+
+        function VerdictBanner({ verdict, score, mode = "ai" }) {
+            const color = (mode === "ai" ? (score > 65 ? C.red : score > 35 ? C.amber : C.teal) : (score > 65 ? C.teal : score > 35 ? C.amber : C.red));
+            return (
+                <div style={{ background: `${color}0f`, border: `1px solid ${color}40`, borderRadius: 8, padding: "14px 18px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                    <div>
+                        <div style={{ fontSize: 10, color: C.muted, fontFamily: "monospace", letterSpacing: "0.1em", marginBottom: 4 }}>{mode === "ai" ? "AI DETECTION VERDICT" : "ORIGINALITY VERDICT"}</div>
+                        <div style={{ fontSize: 20, fontWeight: 700, color, fontFamily: "monospace" }}>{verdict}</div>
+                    </div>
+                    <ScoreRing score={score} label={mode === "ai" ? "AI PROB" : "ORIGINAL"} mode={mode} size={90} />
+                </div>
+            );
+        }
+
+        function InfoRow({ label, value, note }) {
+            return (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "7px 0", borderBottom: `1px solid ${C.border}` }}>
+                    <span style={{ fontSize: 11, color: C.muted, fontFamily: "monospace" }}>{label}</span>
+                    <span style={{ fontSize: 12, color: C.text, fontFamily: "monospace" }}>{value}{note && <span style={{ color: C.muted, marginLeft: 6, fontSize: 10 }}>{note}</span>}</span>
+                </div>
+            );
+        }
+
+        function Spinner() { return <div style={{ width: 14, height: 14, border: `2px solid ${C.amber}`, borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.7s linear infinite", display: "inline-block" }} />; }
+
+        // ═══════════════════════════════════════════════════════
+        //  MAIN APP
+        // ═══════════════════════════════════════════════════════
+        function App() {
+            const [tab, setTab] = useState(0);
+            const [text, setText] = useState("");
+            const [file, setFile] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [progress, setProgress] = useState(0);
+            const [error, setError] = useState("");
+            const [detectResult, setDetectResult] = useState(null);
+            const [humanizeResult, setHumanizeResult] = useState(null);
+            const [plagResult, setPlagResult] = useState(null);
+            const [copied, setCopied] = useState(false);
+            const [reasoning, setReasoning] = useState(null);
+            const [reasoningLoading, setReasoningLoading] = useState(false);
+
+            async function handleDetect() {
+                if (!text.trim() && !file) return;
+                setLoading(true); setDetectResult(null); setProgress(0); setReasoning(null);
+                try {
+                    const formData = new FormData();
+                    if (file) formData.append("file", file);
+                    else formData.append("file", new File([text], "pasted.txt", { type: "text/plain" }));
+
+                    const resp = await fetch(`${API_BASE}/upload_and_analyze`, { method: "POST", body: formData });
+                    const res = await resp.json();
+                    if (res.full_text) setText(res.full_text);
+
+                    const local = computeLocalSignals(res.full_text || text);
+                    const finalAI = res.overall_ai_score ? Math.round(res.overall_ai_score * 0.65 + local.localAI * 0.35) : local.localAI;
+                    const verdict = finalAI >= 80 ? "AI Generated" : finalAI >= 62 ? "Likely AI" : finalAI >= 40 ? "Mixed / Uncertain" : "Human Written";
+                    setDetectResult({ finalAI, local, verdict, rawScore: res.overall_ai_score });
+                } catch (e) { setError(e.message); } finally { setLoading(false); setProgress(100); }
+            }
+
+            async function getReasoning() {
+                if (!detectResult || reasoningLoading) return;
+                setReasoningLoading(true);
+                try {
+                    const resp = await fetch(`${API_BASE}/verify_with_llm`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            text: text,
+                            metrics: {
+                                ai_score: detectResult.finalAI,
+                                burstiness: detectResult.local.burstiness.cv,
+                                ttr: detectResult.local.ttr.ttr
+                            }
+                        })
+                    });
+                    const res = await resp.json();
+                    setReasoning(res.reasoning);
+                } catch (e) { setReasoning("Failed to get LLM reasoning: " + e.message); }
+                finally { setReasoningLoading(false); }
+            }
+
+            async function handleHumanize() {
+                if (!text.trim() && !file) return;
+                setLoading(true); setHumanizeResult(null); setProgress(0);
+                try {
+                    let baseText = text;
+                    if (file && !text) {
+                        const formData = new FormData(); formData.append("file", file);
+                        const parseRes = await (await fetch(`${API_BASE}/upload_and_analyze`, { method: "POST", body: formData })).json();
+                        baseText = parseRes.full_text; setText(baseText);
+                    }
+                    const chunks = splitSentences(baseText).reduce((acc, s) => {
+                        let last = acc[acc.length - 1];
+                        if (!last || (last.length + s.length > 800)) acc.push(s); else acc[acc.length - 1] += " " + s;
+                        return acc;
+                    }, []);
+
+                    const response = await fetch(`${API_BASE}/humanize`, {
+                        method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ chunks })
+                    });
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let done = false;
+                    let chunkResults = [];
+                    while (!done) {
+                        const { value, done: d } = await reader.read(); done = d;
+                        if (value) {
+                            const chunkStr = decoder.decode(value);
+                            const lines = chunkStr.split('\n');
+                            for (let line of lines) {
+                                if (line.startsWith('data: ')) {
+                                    const dataStr = line.replace('data: ', '').trim();
+                                    if (dataStr === '[DONE]') break;
+                                    try {
+                                        const msg = JSON.parse(dataStr);
+                                        chunkResults[msg.chunk_id] = msg;
+                                        setProgress(Math.round((chunkResults.filter(Boolean).length / chunks.length) * 100));
+                                    } catch (e) { }
+                                }
+                            }
+                        }
+                    }
+                    const humanized = chunkResults.map(c => c.rewritten_text).join(" ");
+                    setHumanizeResult({
+                        original: baseText,
+                        humanized,
+                        chunks: chunkResults,
+                        before: computeLocalSignals(baseText),
+                        after: computeLocalSignals(humanized)
+                    });
+                } catch (e) { setError(e.message); } finally { setLoading(false); setProgress(100); }
+            }
+
+            return (
+                <div style={{ maxWidth: 860, margin: "0 auto", padding: "40px 20px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 30 }}>
+                        <div style={{ fontFamily: "monospace", fontWeight: 700, fontSize: 24 }}>FORENSIC<span style={{ color: C.amber }}>TEXT</span></div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                            {["DETECTOR", "HUMANIZER", "PLAGIARISM"].map((l, i) => (
+                                <button key={i} onClick={() => setTab(i)} style={{ background: "none", border: "none", color: tab === i ? C.amber : C.muted, cursor: "pointer", fontFamily: "monospace", fontSize: 12, borderBottom: tab === i ? `2px solid ${C.amber}` : "none", paddingBottom: 4 }}>{l}</button>
+                            ))}
+                        </div>
+                    </div>
+
+                    <div style={{ marginBottom: 20 }}>
+                        <input type="file" id="f" style={{ display: "none" }} onChange={e => { setFile(e.target.files[0]); setText(""); }} />
+                        <label htmlFor="f" style={{ background: C.surface, border: `1px dashed ${C.border}`, padding: "10px 20px", borderRadius: 8, cursor: "pointer", display: "inline-block", fontSize: 13 }}>
+                            {file ? `📎 ${file.name}` : "📄 Upload PDF/DOCX (100+ pages)"}
+                        </label>
+                    </div>
+
+                    <textarea value={text} onChange={e => setText(e.target.value)} rows={8} style={{ width: "100%", background: C.surface, border: `1px solid ${C.border}`, color: C.text, padding: 15, borderRadius: 10, fontSize: 14, marginBottom: 20, resize: "none" }} placeholder="Paste text here..." />
+
+                    <div style={{ display: "flex", gap: 15, marginBottom: 30 }}>
+                        <button onClick={tab === 0 ? handleDetect : tab === 1 ? handleHumanize : () => setPlagResult(computePlagiarismSignals(text))} disabled={loading} style={{ background: `linear-gradient(135deg, #1a3060, #0d2050)`, border: `1px solid ${C.borderLight}`, color: C.amber, padding: "12px 30px", borderRadius: 8, cursor: "pointer", fontWeight: 700, fontFamily: "monospace" }}>
+                            {loading ? <Spinner /> : tab === 0 ? "RUN DETECT" : tab === 1 ? "HUMANIZE" : "CHECK PLAG"}
+                        </button>
+                    </div>
+
+                    {error && <div style={{ color: C.red, marginBottom: 20 }}>{error}</div>}
+
+                    <div className="panel">
+                        {tab === 0 && detectResult && (
+                            <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                                <VerdictBanner verdict={detectResult.verdict} score={detectResult.finalAI} />
+
+                                <div style={{ background: C.surface, padding: 20, borderRadius: 10 }}>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 15 }}>
+                                        <div style={{ fontSize: 11, color: C.muted, fontFamily: "monospace" }}>LLM SECOND OPINION (VERIFICATION)</div>
+                                        <button onClick={getReasoning} disabled={reasoningLoading} style={{ background: C.bg, border: `1px solid ${C.borderLight}`, color: C.teal, padding: "5px 12px", borderRadius: 4, cursor: "pointer", fontSize: 10, fontFamily: "monospace" }}>
+                                            {reasoningLoading ? <Spinner /> : "GET REASONING"}
+                                        </button>
+                                    </div>
+                                    {reasoning && (
+                                        <div style={{ background: C.bg, padding: 15, borderRadius: 8, fontSize: 13, lineHeight: 1.6, color: C.text, borderLeft: `3px solid ${C.teal}`, marginBottom: 15, whiteSpace: "pre-wrap" }}>
+                                            {reasoning}
+                                        </div>
+                                    )}
+                                    <InfoRow label="Burstiness" value={detectResult.local.burstiness.cv} note={detectResult.local.burstiness.label} />
+                                    <InfoRow label="Transitions" value={detectResult.local.transitions.count} />
+                                    <BurstinessChart lengths={detectResult.local.burstiness.lengths} mean={detectResult.local.burstiness.mean} />
+                                </div>
+                            </div>
+                        )}
+                        {tab === 1 && humanizeResult && (
+                            <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                                <div style={{ background: C.surface, padding: 20, borderRadius: 10 }}>
+                                    <div style={{ fontSize: 11, color: C.muted, marginBottom: 15 }}>HUMANIZED OUTPUT (WITH HIGHLIGHTS)</div>
+                                    <DiffViewer chunks={humanizeResult.chunks} />
+                                    <div style={{ display: "flex", gap: 15, marginTop: 15 }}>
+                                        <div style={{ fontSize: 10, color: C.muted }}> <span style={{ color: C.red, textDecoration: "line-through" }}>Red</span> = Removed AI Text </div>
+                                        <div style={{ fontSize: 10, color: C.muted }}> <span style={{ color: C.green, fontWeight: "bold" }}>Green</span> = Added Human-like Text </div>
+                                    </div>
+                                    <button onClick={() => { navigator.clipboard.writeText(humanizeResult.humanized); setCopied(true); setTimeout(() => setCopied(false), 2000); }}
+                                        style={{ marginTop: 20, background: copied ? `${C.teal}20` : C.bg, border: `1px solid ${copied ? C.teal : C.border}`, color: copied ? C.teal : C.muted, padding: "8px 16px", borderRadius: 4, cursor: "pointer", fontSize: 11, fontFamily: "monospace" }}>
+                                        {copied ? "✓ COPIED" : "⎘ COPY FINAL TEXT"}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById("root"));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>
