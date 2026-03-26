@@ -1,7 +1,7 @@
 import os
 import re
 import difflib
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
@@ -20,6 +20,11 @@ try:
     import docx
 except ImportError:
     docx = None
+
+try:
+    import pypandoc
+except ImportError:
+    pypandoc = None
 
 # Attempt to load Transformers and Torch for local AI Models
 try:
@@ -228,10 +233,16 @@ async def humanize_stream(req: HumanizeRequest):
             out = paraphrase_model(prompt, max_length=512, num_return_sequences=1, truncation=True)
             rewritten_text = out[0]['generated_text']
             
+            # Fix T5 tokenizer punctuation spacing issues (e.g., "headset ." -> "headset.")
+            import re
+            rewritten_text = re.sub(r'\s+([?.!,:;)}\]])', r'\1', rewritten_text)
+            rewritten_text = re.sub(r'([({\[])\s+', r'\1', rewritten_text)
+            
             # Generate a word-level diff for highlighting
             s1 = chunk.split()
             s2 = rewritten_text.split()
-            matcher = difflib.SequenceMatcher(None, s1, s2)
+            # Use case-insensitive matching so "Sentences" vs "sentences" isn't flagged as a major replacement
+            matcher = difflib.SequenceMatcher(None, [w.lower() for w in s1], [w.lower() for w in s2])
             diff_ops = matcher.get_opcodes()
             
             # Send standard Server-Sent Event (SSE)
@@ -319,6 +330,77 @@ async def verify_with_llm(req: VerifyRequest):
             return {"reasoning": "Ollama server error or model 'llama3' not found.", "status": "error"}
     except Exception as e:
         return {"reasoning": f"Could not connect to Ollama: {str(e)}", "status": "error"}
+
+@app.post("/api/convert_to_latex")
+async def convert_to_latex(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """
+    Converts a .docx or .txt file to a .tex LaTeX document.
+    Uses pypandoc if available and pandoc is installed.
+    Otherwise, gracefully falls back to a custom Python conversion.
+    """
+    import tempfile
+    import io
+    
+    filename = file.filename.lower()
+    if not (filename.endswith(".docx") or filename.endswith(".txt")):
+        raise HTTPException(status_code=400, detail="Only .docx and .txt files are supported for LaTeX conversion.")
+        
+    content = await file.read()
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx" if filename.endswith(".docx") else ".txt") as temp_input:
+        temp_input.write(content)
+        temp_input_path = temp_input.name
+        
+    temp_output_path = temp_input_path + ".tex"
+    
+    # Ensure cleanup of both input and output files after response is sent
+    def cleanup():
+        for p in [temp_input_path, temp_output_path]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except:
+                    pass
+    background_tasks.add_task(cleanup)
+    
+    conversion_successful = False
+    
+    if pypandoc:
+        try:
+            # Requires pandoc software to be installed on system
+            pypandoc.convert_file(temp_input_path, 'latex', outputfile=temp_output_path)
+            conversion_successful = True
+        except Exception as e:
+            print(f"Pypandoc conversion failed or pandoc not installed: {e}")
+            
+    if not conversion_successful:
+        # Fallback manual conversion relying on python-docx or raw text
+        latex_content = "\\documentclass{article}\n\\usepackage[utf8]{inputenc}\n\\begin{document}\n\n"
+        
+        if filename.endswith(".docx"):
+            if not docx:
+                raise HTTPException(status_code=500, detail="Pandoc missing and python-docx not installed. Cannot parse DOCX.")
+            
+            doc = docx.Document(io.BytesIO(content))
+            for para in doc.paragraphs:
+                cleaned = para.text.replace("\\", "\\textbackslash{}").replace("&", "\\&").replace("%", "\\%").replace("$", "\\$").replace("#", "\\#").replace("_", "\\_").replace("{", "\\{").replace("}", "\\}").replace("~", "\\textasciitilde{}").replace("^", "\\textasciicircum{}")
+                if cleaned.strip():
+                    latex_content += cleaned + "\n\n"
+        else:
+            text = content.decode("utf-8", errors="ignore")
+            cleaned = text.replace("\\", "\\textbackslash{}").replace("&", "\\&").replace("%", "\\%").replace("$", "\\$").replace("#", "\\#").replace("_", "\\_").replace("{", "\\{").replace("}", "\\}").replace("~", "\\textasciitilde{}").replace("^", "\\textasciicircum{}")
+            for para in cleaned.split("\n"):
+                if para.strip():
+                    latex_content += para.strip() + "\n\n"
+                
+        latex_content += "\\end{document}\n"
+        
+        with open(temp_output_path, "w", encoding="utf-8") as f:
+            f.write(latex_content)
+            
+    # Extract original name without extension to create .tex filename
+    response_filename = file.filename.rsplit(".", 1)[0] + ".tex"
+    return FileResponse(temp_output_path, media_type="application/x-tex", filename=response_filename)
 
 # To run:
 # pip install fastapi uvicorn transformers torch PyMuPDF python-docx
